@@ -9,8 +9,6 @@ import java.time.LocalDateTime;
 
 @Entity
 @Table(name = "hardening_jobs")
-@Data
-
 public class HardeningJob {
 
     @Id
