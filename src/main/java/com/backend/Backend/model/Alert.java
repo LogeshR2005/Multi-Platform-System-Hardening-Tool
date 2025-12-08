@@ -11,8 +11,6 @@ import java.time.LocalDateTime;
 @Entity
 @Table(name = "alerts")
 @Data
-@NoArgsConstructor
-@AllArgsConstructor
 public class Alert {
 
     @Id
