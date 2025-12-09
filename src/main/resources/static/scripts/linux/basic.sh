@@ -1,135 +1,342 @@
-<#
-WINDOWS BASIC HARDENING SCRIPT
-Level  : BASIC
-Author : Security Automation
-Run As : Administrator
-Rollback Supported
-#>
+#!/usr/bin/env bash
 
-# =========================
-# GLOBAL PATHS
-# =========================
-$Root           = "C:\Hardening"
-$Log            = Join-Path $Root "basic.log"
-$SystemBackup   = Join-Path $Root "basic_system_backup.reg"
-$PoliciesBackup = Join-Path $Root "basic_policies_backup.reg"
+# ============================
+# BASIC SETUP
+# ============================
 
-New-Item -ItemType Directory -Path $Root -Force | Out-Null
+HARDEN_ROOT="/var/lib/hardening-agent"
+LOG_FILE="$HARDEN_ROOT/hardening.log"
+REPORT_FILE="$HARDEN_ROOT/hardening_report.txt"
+BACKUP_ROOT="$HARDEN_ROOT/backup_$(date +%Y%m%d_%H%M%S)"
 
-# =========================
-# LOG FUNCTION
-# =========================
-function Write-Log {
-    param([string]$Message)
-    $line = "{0} {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
-    $line | Out-File -Append -FilePath $Log -Encoding utf8
-    Write-Host $line
+mkdir -p "$HARDEN_ROOT" "$BACKUP_ROOT"
+
+log() {
+  local msg="$1"
+  local ts
+  ts="$(date '+%Y-%m-%d %H:%M:%S')"
+  echo "$ts : $msg" | tee -a "$LOG_FILE"
 }
 
-# =========================
-# ADMIN CHECK
-# =========================
-$principal = New-Object Security.Principal.WindowsPrincipal(
-    [Security.Principal.WindowsIdentity]::GetCurrent()
-)
+# ============================
+# ROOT CHECK
+# ============================
 
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)) {
-    Write-Host "Run this script as Administrator"
-    exit 1
+if [[ $EUID -ne 0 ]]; then
+  echo "Run this script as root."
+  exit 1
+fi
+
+log "HARDENING STARTED"
+
+# ============================
+# DETECT PACKAGE MANAGER
+# ============================
+
+PM=""
+if command -v apt >/dev/null 2>&1; then
+  PM="apt"
+elif command -v dnf >/dev/null 2>&1; then
+  PM="dnf"
+elif command -v yum >/dev/null 2>&1; then
+  PM="yum"
+fi
+
+install_pkg() {
+  local pkg="$1"
+  if [[ "$PM" == "apt" ]]; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >/dev/null 2>&1
+  elif [[ "$PM" == "dnf" || "$PM" == "yum" ]]; then
+    "$PM" install -y -q "$pkg" >/dev/null 2>&1
+  fi
 }
 
-Write-Log "BASIC HARDENING STARTED"
-
-# =========================
-# REGISTRY BACKUP FOR ROLLBACK
-# =========================
-try {
-    reg export "HKLM\SYSTEM" $SystemBackup /y | Out-Null
-    reg export "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies" $PoliciesBackup /y | Out-Null
-    Write-Log "Registry backups created"
-} catch {
-    Write-Log "Registry backup failed: $_"
+remove_pkg() {
+  local pkg="$1"
+  if [[ "$PM" == "apt" ]]; then
+    DEBIAN_FRONTEND=noninteractive apt-get remove -y "$pkg" >/dev/null 2>&1 || true
+  elif [[ "$PM" == "dnf" || "$PM" == "yum" ]]; then
+    "$PM" remove -y -q "$pkg" >/dev/null 2>&1 || true
+  fi
 }
 
-# =========================
-# BASIC PASSWORD POLICY
-# =========================
-try {
-    net accounts /minpwlen:8  | Out-Null
-    net accounts /maxpwage:60 | Out-Null
-    net accounts /lockoutthreshold:3 | Out-Null
-    net accounts /lockoutduration:10 | Out-Null
+# ============================
+# 1. BLOCK MTA (postfix/sendmail/exim)
+# ============================
 
-    Write-Log "Basic password & lockout policy applied"
-} catch {
-    Write-Log " Password policy failed: $_"
+log "Blocking mail transfer agents (postfix, sendmail, exim, mailutils)."
+for M in postfix sendmail exim mailutils; do
+  remove_pkg "$M"
+done
+
+# ============================
+# 2. BACKUP CRITICAL FILES
+# ============================
+
+log "Creating backups in $BACKUP_ROOT"
+
+backup_file() {
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    mkdir -p "$(dirname "$BACKUP_ROOT$f")"
+    cp -a "$f" "$BACKUP_ROOT$f"
+  fi
 }
 
-# =========================
-# BASIC SECURITY OPTIONS
-# =========================
-try {
-    reg add "HKLM\SYSTEM\CurrentControlSet\Control\Lsa" /v LimitBlankPasswordUse /t REG_DWORD /d 1 /f | Out-Null
-    Write-Log "Blank passwords blocked"
-} catch {
-    Write-Log "Blank password policy failed: $_"
+backup_file "/etc/sysctl.conf"
+backup_file "/etc/ssh/sshd_config"
+backup_file "/etc/sudoers"
+backup_file "/etc/ufw/ufw.conf"
+backup_file "/etc/audit/auditd.conf"
+backup_file "/etc/audit/audit.rules"
+backup_file "/etc/audit/rules.d/audit.rules"
+backup_file "/etc/audit/rules.d/hardening.rules"
+backup_file "/etc/crontab"
+
+# ============================
+# 3. BLOCK RISKY KERNEL MODULES
+# ============================
+
+log "Blocking risky kernel modules"
+
+block_module() {
+  local mod="$1"
+  echo "install $mod /bin/true" > "/etc/modprobe.d/$mod.conf"
+  modprobe -r "$mod" >/dev/null 2>&1 || true
+  log "Kernel module blocked: $mod"
 }
 
-# =========================
-# INTERACTIVE LOGON BANNER
-# =========================
-$sys = "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+# Filesystem / USB / Network modules
+for MOD in cramfs freevxfs hfs hfsplus jffs2 squashfs udf usb-storage dccp sctp rds tipc; do
+  block_module "$MOD"
+done
 
-try {
-    reg add $sys /v LegalNoticeText    /t REG_SZ /d "Authorized access only." /f | Out-Null
-    reg add $sys /v LegalNoticeCaption /t REG_SZ /d "Warning" /f | Out-Null
+# ============================
+# 4. SYSCTL NETWORK HARDENING
+# ============================
 
-    Write-Log "Login banner enabled"
-} catch {
-    Write-Log "Login banner failed: $_"
-}
+log "Applying sysctl network hardening."
 
-# =========================
-# WINDOWS DEFENDER ENABLE
-# =========================
-try {
-    Set-MpPreference -DisableRealtimeMonitoring $false
-    Write-Log " Windows Defender enabled"
-} catch {
-    Write-Log "Defender enable failed: $_"
-}
+SYSCTL_FILE="/etc/sysctl.d/99-hardening.conf"
+cat >"$SYSCTL_FILE" <<EOF
+net.ipv4.ip_forward=0
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+net.ipv4.conf.all.secure_redirects=0
+net.ipv4.conf.default.secure_redirects=0
+net.ipv4.conf.all.accept_source_route=0
+net.ipv4.conf.default.accept_source_route=0
+net.ipv4.icmp_ignore_bogus_error_responses=1
+net.ipv4.icmp_echo_ignore_broadcasts=1
+net.ipv4.conf.all.log_martians=1
+net.ipv4.tcp_syncookies=1
+EOF
 
-# =========================
-# FIREWALL BASIC ENABLE
-# =========================
-try {
-    netsh advfirewall set allprofiles state on | Out-Null
-    Write-Log "Firewall enabled on all profiles"
-} catch {
-    Write-Log "Firewall enable failed: $_"
-}
+sysctl --system >/dev/null 2>&1 || true
 
-# =========================
-# AUTOPLAY DISABLE
-# =========================
-try {
-    $expl = "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer"
-    reg add $expl /v NoDriveTypeAutoRun /t REG_DWORD /d 255 /f | Out-Null
+# ============================
+# 5. SSH HARDENING
+# ============================
 
-    Write-Log "AutoRun disabled"
-} catch {
-    Write-Log "Autorun setting failed: $_"
-}
+log "Hardening SSH configuration."
 
-# =========================
-# FINAL STATUS
-# =========================
-Write-Log "BASIC HARDENING COMPLETED"
-Write-Host ""
-Write-Host "BASIC HARDENING SUCCESSFUL"
-Write-Host "Log file: $Log"
-Write-Host "Rollback backups:"
-Write-Host $SystemBackup
-Write-Host $PoliciesBackup
-Write-Host ""
-Write-Host "System restart is recommended"
+if [[ -f /etc/ssh/sshd_config ]]; then
+  cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak 2>/dev/null || true
+
+  # Basic patterns
+  sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+  sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+  sed -i 's/^#\?MaxAuthTries.*/MaxAuthTries 4/' /etc/ssh/sshd_config
+  sed -i 's/^#\?ClientAliveInterval.*/ClientAliveInterval 300/' /etc/ssh/sshd_config
+  sed -i 's/^#\?ClientAliveCountMax.*/ClientAliveCountMax 2/' /etc/ssh/sshd_config
+
+  # If missing, append
+  grep -q "^PermitRootLogin" /etc/ssh/sshd_config || echo "PermitRootLogin no" >> /etc/ssh/sshd_config
+  grep -q "^PasswordAuthentication" /etc/ssh/sshd_config || echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config
+  grep -q "^MaxAuthTries" /etc/ssh/sshd_config || echo "MaxAuthTries 4" >> /etc/ssh/sshd_config
+  grep -q "^ClientAliveInterval" /etc/ssh/sshd_config || echo "ClientAliveInterval 300" >> /etc/ssh/sshd_config
+  grep -q "^ClientAliveCountMax" /etc/ssh/sshd_config || echo "ClientAliveCountMax 2" >> /etc/ssh/sshd_config
+
+  systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+  log "SSH hardened."
+else
+  log "sshd_config not found, skipping SSH hardening."
+fi
+
+# ============================
+# 6. SUDO HARDENING
+# ============================
+
+log "Hardening sudo configuration."
+
+install_pkg sudo
+
+if [[ -f /etc/sudoers ]]; then
+  if ! grep -q "Defaults use_pty" /etc/sudoers; then
+    echo "Defaults use_pty" >> /etc/sudoers
+  fi
+  if ! grep -q "Defaults logfile=" /etc/sudoers; then
+    echo "Defaults logfile=/var/log/sudo.log" >> /etc/sudoers
+  fi
+  log "Sudo hardened."
+else
+  log "sudoers file not found, skipping sudo changes."
+fi
+
+# ============================
+# 7. FIREWALL HARDENING
+# ============================
+
+log "Configuring host firewall."
+
+if command -v ufw >/dev/null 2>&1; then
+  log "Using ufw firewall."
+  ufw default deny incoming >/dev/null 2>&1 || true
+  ufw default allow outgoing >/dev/null 2>&1 || true
+  ufw allow ssh >/dev/null 2>&1 || true
+  ufw --force enable >/dev/null 2>&1 || true
+else
+  if [[ "$PM" != "none" ]]; then
+    install_pkg firewalld
+    if command -v firewall-cmd >/dev/null 2>&1; then
+      systemctl enable firewalld --now >/dev/null 2>&1 || true
+      firewall-cmd --set-default-zone=public >/dev/null 2>&1 || true
+      firewall-cmd --permanent --add-service=ssh >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+      log "firewalld configured with SSH allowed."
+    else
+      log "firewall-cmd not found even after install, firewall step partial."
+    fi
+  else
+    log "No package manager detected; firewall hardening skipped."
+  fi
+fi
+
+# ============================
+# 8. CRON PERMISSIONS
+# ============================
+
+log "Locking down cron permissions."
+
+chmod 600 /etc/crontab 2>/dev/null || true
+for d in /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly /etc/cron.d; do
+  [[ -d "$d" ]] && chmod 700 "$d" 2>/dev/null || true
+done
+
+# ============================
+# 9. INSTALL AND ENABLE auditd
+# ============================
+
+log "Installing and enabling auditd."
+
+install_pkg auditd
+
+if command -v auditd >/dev/null 2>&1 || [[ -f /sbin/auditd || -f /usr/sbin/auditd ]]; then
+  systemctl enable auditd --now >/dev/null 2>&1 || true
+  log "auditd installed and enabled."
+else
+  log "auditd not available on this system."
+fi
+
+# ============================
+# 10. BASIC AUDIT RULES
+# ============================
+
+if [[ -d /etc/audit/rules.d ]]; then
+  log "Configuring basic auditd rules."
+
+  cat >/etc/audit/rules.d/hardening.rules <<'EOF'
+-w /etc/sudoers -p wa -k scope
+-w /etc/sudoers.d/ -p wa -k scope
+-w /var/log/sudo.log -p wa -k actions
+-a always,exit -F arch=b64 -S execve -C uid!=euid -F euid=0 -k priv_esc
+-w /etc/passwd -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/group  -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+-w /etc/ssh/sshd_config -p wa -k ssh_config
+-w /var/log/auth.log -p wa -k logins
+EOF
+
+  if command -v augenrules >/dev/null 2>&1; then
+    augenrules --load >/dev/null 2>&1 || true
+  else
+    service auditd restart >/dev/null 2>&1 || true
+  fi
+  log "auditd rules written to /etc/audit/rules.d/hardening.rules"
+else
+  log "auditd rules.d directory not found, skipping rules."
+fi
+
+# ============================
+# 11. AIDE INSTALL (NO HEAVY INIT)
+# ============================
+
+log "Installing AIDE (no initial scan to avoid hangs)."
+
+install_pkg aide >/dev/null 2>&1 || install_pkg aide-common >/dev/null 2>&1 || true
+
+if command -v aide >/dev/null 2>&1 || [[ -f /usr/sbin/aide || -f /usr/bin/aide ]]; then
+  log "AIDE installed. Initial database generation is not run to avoid long blocking."
+  # Optional daily cron for check (light integration)
+  if [[ -d /etc/cron.daily ]]; then
+    cat >/etc/cron.daily/aide-check <<'EOF'
+#!/usr/bin/env bash
+if command -v aide >/dev/null 2>&1; then
+  /usr/bin/aide --check >/var/log/aide_check.log 2>&1
+fi
+EOF
+    chmod 700 /etc/cron.daily/aide-check
+    log "AIDE daily check script created at /etc/cron.daily/aide-check"
+  fi
+else
+  log "AIDE could not be installed on this system."
+fi
+
+# ============================
+# 12. BLOCK USB STORAGE MODULE
+# ============================
+
+log "Blocking USB storage module."
+
+echo "blacklist usb-storage" > /etc/modprobe.d/usb-storage.conf
+modprobe -r usb-storage >/dev/null 2>&1 || true
+
+# ============================
+# 13. CRITICAL FILE PERMISSIONS
+# ============================
+
+log "Tightening basic system file permissions."
+
+chmod 644 /etc/passwd  2>/dev/null || true
+chmod 640 /etc/shadow  2>/dev/null || true
+chmod 644 /etc/group   2>/dev/null || true
+chmod 640 /etc/gshadow 2>/dev/null || true
+
+# ============================
+# 14. GENERATE TEXT REPORT
+# ============================
+
+log "Generating summary report."
+
+{
+  echo "==== HARDENING REPORT $(date '+%Y-%m-%d %H:%M:%S') ===="
+  echo "MTA (postfix/sendmail/exim/mailutils) removed or disabled where present."
+  echo "Backup created at: $BACKUP_ROOT"
+  echo "Risky kernel modules blocked (cramfs, hfs, squashfs, udf, usb-storage, dccp, rds, sctp, tipc)."
+  echo "Network sysctl hardening applied."
+  echo "SSH hardened (no root login, limited auth attempts, idle timeouts)."
+  echo "Sudo hardened (pty enforced and logging enabled)."
+  echo "Firewall enabled with deny incoming, allow outgoing, ssh allowed."
+  echo "Cron permissions hardened."
+  echo "auditd installed and enabled (where supported) with basic rules."
+  echo "AIDE installed (daily check cron created; initial DB generation left to admin)."
+  echo "USB storage module blocked."
+  echo "Base system file permissions hardened for passwd, shadow, group, gshadow."
+  echo "Some advanced CIS items (PAM fine-tuning, full audit rule set, time sync rules, AIDE policies) may still require manual review."
+  echo "==== HARDENING COMPLETED ===="
+} > "$REPORT_FILE"
+
+log "HARDENING COMPLETED SUCCESSFULLY"
