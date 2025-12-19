@@ -57,9 +57,6 @@ This project simplifies the process by providing **one‑click, automated OS har
 
 ---
 
-
----
-
 ## 📄 Reporting Output
 
 Each hardening action records:
